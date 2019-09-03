@@ -238,34 +238,29 @@ struct sdhci_msm_offset sdhci_msm_offset_mci_removed = {
 	.CORE_DLL_USR_CTL = 0x388,
 };
 
-struct sdhci_msm_offset sdhci_msm_offset_mci_present = {
-	.CORE_MCI_DATA_CNT = 0x30,
-	.CORE_MCI_STATUS = 0x34,
-	.CORE_MCI_FIFO_CNT = 0x44,
-	.CORE_MCI_VERSION = 0x050,
-	.CORE_GENERICS = 0x70,
-	.CORE_TESTBUS_CONFIG = 0x0CC,
-	.CORE_TESTBUS_SEL2_BIT = 4,
-	.CORE_TESTBUS_ENA = (1 << 3),
-	.CORE_TESTBUS_SEL2 = (1 << 4),
-	.CORE_PWRCTL_STATUS = 0xDC,
-	.CORE_PWRCTL_MASK = 0xE0,
-	.CORE_PWRCTL_CLEAR = 0xE4,
-	.CORE_PWRCTL_CTL = 0xE8,
-	.CORE_SDCC_DEBUG_REG = 0x124,
-	.CORE_DLL_CONFIG = 0x100,
-	.CORE_DLL_STATUS = 0x108,
-	.CORE_VENDOR_SPEC = 0x10C,
-	.CORE_VENDOR_SPEC_ADMA_ERR_ADDR0 = 0x114,
-	.CORE_VENDOR_SPEC_ADMA_ERR_ADDR1 = 0x118,
-	.CORE_VENDOR_SPEC_FUNC2 = 0x110,
-	.CORE_VENDOR_SPEC_CAPABILITIES0 = 0x11C,
-	.CORE_DDR_200_CFG = 0x184,
-	.CORE_VENDOR_SPEC3 = 0x1B0,
-	.CORE_DLL_CONFIG_2 = 0x1B4,
-	.CORE_DLL_CONFIG_3 = 0x1B8,
-	.CORE_DDR_CONFIG_OLD = 0x1B8, /* Applicable to sdcc minor ver < 0x49 */
-	.CORE_DDR_CONFIG = 0x1BC,
+#define CDR_SELEXT_SHIFT	20
+#define CDR_SELEXT_MASK		(0xf << CDR_SELEXT_SHIFT)
+#define CMUX_SHIFT_PHASE_SHIFT	24
+#define CMUX_SHIFT_PHASE_MASK	(7 << CMUX_SHIFT_PHASE_SHIFT)
+
+#define MSM_MMC_AUTOSUSPEND_DELAY_MS	50
+struct sdhci_msm_host {
+	struct platform_device *pdev;
+	void __iomem *core_mem;	/* MSM SDCC mapped address */
+	int pwr_irq;		/* power irq */
+	struct clk *clk;	/* main SD/MMC bus clock */
+	struct clk *pclk;	/* SDHC peripheral bus clock */
+	struct clk *bus_clk;	/* SDHC bus voter clock */
+	struct clk *xo_clk;	/* TCXO clk needed for FLL feature of cm_dll*/
+	unsigned long clk_rate;
+	struct mmc_host *mmc;
+	bool use_14lpp_dll_reset;
+	bool tuning_done;
+	bool calibration_done;
+	u8 saved_tuning_phase;
+	bool use_cdclp533;
+	bool use_cdr;
+	u32 transfer_mode;
 };
 
 u8 sdhci_msm_readb_relaxed(struct sdhci_host *host, u32 offset)
@@ -1131,36 +1126,24 @@ out:
 	return ret;
 }
 
-static void sdhci_msm_set_mmc_drv_type(struct sdhci_host *host, u32 opcode,
-		u8 drv_type)
+static void sdhci_msm_set_cdr(struct sdhci_host *host, bool enable)
 {
-	struct mmc_command cmd = {0};
-	struct mmc_request mrq = {NULL};
-	struct mmc_host *mmc = host->mmc;
-	u8 val = ((drv_type << 4) | 2);
+	u32 config, oldconfig = readl_relaxed(host->ioaddr + CORE_DLL_CONFIG);
 
-	cmd.opcode = MMC_SWITCH;
-	cmd.arg = (MMC_SWITCH_MODE_WRITE_BYTE << 24) |
-		(EXT_CSD_HS_TIMING << 16) |
-		(val << 8) |
-		EXT_CSD_CMD_SET_NORMAL;
-	cmd.flags = MMC_CMD_AC | MMC_RSP_R1B;
-	/* 1 sec */
-	cmd.busy_timeout = 1000 * 1000;
+	config = oldconfig;
+	if (enable) {
+		config |= CORE_CDR_EN;
+		config &= ~CORE_CDR_EXT_EN;
+	} else {
+		config &= ~CORE_CDR_EN;
+		config |= CORE_CDR_EXT_EN;
+	}
 
-	memset(cmd.resp, 0, sizeof(cmd.resp));
-	cmd.retries = 3;
-
-	mrq.cmd = &cmd;
-	cmd.data = NULL;
-
-	mmc_wait_for_req(mmc, &mrq);
-	pr_debug("%s: %s: set card drive type to %d\n",
-			mmc_hostname(mmc), __func__,
-			drv_type);
+	if (config != oldconfig)
+		writel_relaxed(config, host->ioaddr + CORE_DLL_CONFIG);
 }
 
-int sdhci_msm_execute_tuning(struct sdhci_host *host, u32 opcode)
+static int sdhci_msm_execute_tuning(struct mmc_host *mmc, u32 opcode)
 {
 	unsigned long flags;
 	int tuning_seq_cnt = 3;
@@ -1183,10 +1166,16 @@ int sdhci_msm_execute_tuning(struct sdhci_host *host, u32 opcode)
 	 * if clock frequency is greater than 100MHz in these modes.
 	 */
 	if (host->clock <= CORE_FREQ_100MHZ ||
-		!((ios.timing == MMC_TIMING_MMC_HS400) ||
-		(ios.timing == MMC_TIMING_MMC_HS200) ||
-		(ios.timing == MMC_TIMING_UHS_SDR104)))
+	    !(ios.timing == MMC_TIMING_MMC_HS400 ||
+	    ios.timing == MMC_TIMING_MMC_HS200 ||
+	    ios.timing == MMC_TIMING_UHS_SDR104)) {
+		msm_host->use_cdr = false;
+		sdhci_msm_set_cdr(host, false);
 		return 0;
+	}
+
+	/* Clock-Data-Recovery used to dynamically adjust RX sampling point */
+	msm_host->use_cdr = true;
 
 	/*
 	 * Don't allow re-tuning for CRC errors observed for any commands
@@ -4648,17 +4637,33 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 	msm_host->mmc = host->mmc;
 	msm_host->pdev = pdev;
 
-	/* get the ice device vops if present */
-	ret = sdhci_msm_ice_get_dev(host);
-	if (ret == -EPROBE_DEFER) {
-		/*
-		 * SDHCI driver might be probed before ICE driver does.
-		 * In that case we would like to return EPROBE_DEFER code
-		 * in order to delay its probing.
-		 */
-		dev_err(&pdev->dev, "%s: required ICE device not probed yet err = %d\n",
-			__func__, ret);
-		goto pltfm_free;
+static void sdhci_msm_write_w(struct sdhci_host *host, u16 val, int reg)
+{
+	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
+	struct sdhci_msm_host *msm_host = sdhci_pltfm_priv(pltfm_host);
+
+	switch (reg) {
+	case SDHCI_TRANSFER_MODE:
+		msm_host->transfer_mode = val;
+		break;
+	case SDHCI_COMMAND:
+		if (!msm_host->use_cdr)
+			break;
+		if ((msm_host->transfer_mode & SDHCI_TRNS_READ) &&
+		    (SDHCI_GET_CMD(val) != MMC_SEND_TUNING_BLOCK_HS200) &&
+		    (SDHCI_GET_CMD(val) != MMC_SEND_TUNING_BLOCK))
+			sdhci_msm_set_cdr(host, true);
+		else
+			sdhci_msm_set_cdr(host, false);
+		break;
+	}
+	writew(val, host->ioaddr + reg);
+}
+
+static const struct of_device_id sdhci_msm_dt_match[] = {
+	{ .compatible = "qcom,sdhci-msm-v4" },
+	{},
+};
 
 	} else if (ret == -ENODEV) {
 		/*
@@ -4673,14 +4678,16 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 		goto pltfm_free;
 	}
 
-	/* Extract platform data */
-	if (pdev->dev.of_node) {
-		ret = of_alias_get_id(pdev->dev.of_node, "sdhc");
-		if (ret <= 0) {
-			dev_err(&pdev->dev, "Failed to get slot index %d\n",
-				ret);
-			goto pltfm_free;
-		}
+static const struct sdhci_ops sdhci_msm_ops = {
+	.reset = sdhci_reset,
+	.set_clock = sdhci_msm_set_clock,
+	.get_min_clock = sdhci_msm_get_min_clock,
+	.get_max_clock = sdhci_msm_get_max_clock,
+	.set_bus_width = sdhci_set_bus_width,
+	.set_uhs_signaling = sdhci_msm_set_uhs_signaling,
+	.voltage_switch = sdhci_msm_voltage_switch,
+	.write_w = sdhci_msm_write_w,
+};
 
 		/* Read property to determine if the probe is forced */
 		force_probe = of_find_property(pdev->dev.of_node,
